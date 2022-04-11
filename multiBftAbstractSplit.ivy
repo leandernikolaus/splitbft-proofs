@@ -1,0 +1,453 @@
+#lang ivy1.6
+
+# assumptions: 
+# 1.  In send_new_view and rcv_new_view actions we have a stronger and non realistic assumption : assume is_good(N) -> reported_commit(N,RMAX,V);
+
+################################################################################
+#
+# Modules that should probably come from a standard library
+#
+################################################################################
+
+################################################################################
+#
+# Module for axiomatizing a total order
+#
+################################################################################
+
+module total_order(r) = {
+    axiom r(X,X)                        # Reflexivity
+    axiom r(X, Y) & r(Y, Z) -> r(X, Z)  # Transitivity
+    axiom r(X, Y) & r(Y, X) -> X = Y    # Anti-symmetry
+    axiom r(X, Y) | r(Y, X)             # Totality
+}
+
+
+################################################################################
+#
+# Types, relations and functions describing state of the network
+#
+################################################################################
+
+type preplica
+type creplica
+type ereplica
+type operation
+type pbyzquorum
+type cbyzquorum
+type view
+type slot
+type creport
+type tquorum
+
+individual none: view # null - used for max value on an empty set
+relation le(X:view, Y:view)
+axiom le(none,R) 
+instantiate total_order(le)
+
+relation le_slot(X:slot, Y:slot)
+instantiate total_order(le_slot)
+
+relation pbyzmember(N:preplica, Q:pbyzquorum) # N in Q
+relation pis_good(N:preplica) # ghost, saves if N is Byzantine
+axiom forall Q1:pbyzquorum, Q2:pbyzquorum. exists N:preplica. pbyzmember(N, Q1) & pbyzmember(N, Q2) & pis_good(N) # every two quorums have a good node in thier intersection
+
+relation cbyzmember(N:creplica, Q:cbyzquorum) # N in Q
+relation cis_good(N:creplica) # ghost, saves if N is Byzantine
+axiom forall Q1:cbyzquorum, Q2:cbyzquorum. exists N:creplica. cbyzmember(N, Q1) & cbyzmember(N, Q2) & cis_good(N) # every two quorums have a good node in thier intersection
+
+
+relation tmember(N:ereplica, T:tquorum) # N in T
+relation eis_good(N:ereplica) # ghost, saves if N is Byzantine
+axiom forall T:tquorum. exists N:ereplica. tmember(N, T) & eis_good(N)
+
+relation view_change_msg(N:creplica, R:view, CR:creport)
+relation view_change_proj(N:creplica, R:view)
+relation cleft_view(N:creplica, R:view)
+relation pleft_view(N:preplica, R:view)
+relation prepare_msg(N:preplica, I:slot, R:view, V:operation)
+relation commit_msg(N:creplica, I:slot, R:view, V:operation)
+relation new_view_msg(N:preplica, R:view, Q:cbyzquorum)
+relation checkpoint_msg(N:ereplica, I:slot)
+relation has_new_view(N:preplica, R:view)
+
+# commit report getter functions
+individual maxv(CR:creport, I:slot) : view
+individual maxo(CR:creport, I:slot) : operation
+
+#local messages
+relation l_view_change_msg(O:preplica, N:creplica, R:view, CR:creport)
+relation l_view_change_proj(O:preplica, N:creplica, R:view)
+relation l_prepare_msg(O:creplica, N:preplica, I:slot, R:view, V:operation)
+relation l_preprepare_msg(O:preplica, N:preplica, I:slot, R:view, V:operation)
+relation l_commit_msg(O:ereplica, N:creplica, I:slot, R:view, V:operation)
+relation l_new_view_msg(O:preplica, N:preplica, R:view, Q:cbyzquorum)
+relation l_checkpoint_msg(O:ereplica, N:ereplica, I:slot)
+ 
+
+relation good_commit_msg(N:creplica, I:slot, R:view, V:operation) # ghost relation holding all proved commits
+axiom good_commit_msg(N, I, R, V) <-> (exists Q:pbyzquorum. forall N1:preplica. pbyzmember(N1, Q) -> prepare_msg(N1, I, R, V))
+
+relation committed(I:slot ,R:view, V:operation)
+relation l_committed(N:ereplica, I:slot, V:operation)
+
+individual primary(V:view) : preplica
+
+init ~view_change_msg(N,R,CR)
+init ~view_change_proj(N,R)
+init ~pleft_view(N,R)
+init ~cleft_view(N,R)
+init ~prepare_msg(N,I,R,V)
+init ~commit_msg(N,I,R,V)
+init ~committed(I,R,V)
+init ~new_view_msg(N,R,Q)
+init ~has_new_view(N,R)
+init ~checkpoint_msg(N,I)
+
+init ~l_view_change_msg(O, N, R, CR)
+init ~l_view_change_proj(O, N, R)
+init ~l_prepare_msg(O, N, I, R, V)
+init ~l_preprepare_msg(O, N, I, R, V)
+init ~l_commit_msg(O, N, I, R, V)
+init ~l_new_view_msg(O, N, R, Q)
+init ~l_committed(N, I, V)
+init ~l_checkpoint_msg(O, N, I)
+
+#fix view change after normal protocol
+action send_view_change_msg(n:creplica, r:view, cr:creport) = {
+    assume r ~= none;
+    assume ~cleft_view(n,r);
+
+    assume forall I:slot. ((maxv(cr,I) = none & forall MAXR:view,V:operation. ~(~le(r,MAXR) & commit_msg(n,I,MAXR,V))) |
+                           (maxv(cr,I) ~= none & ~le(r, maxv(cr, I)) & commit_msg(n,I,maxv(cr,I),maxo(cr,I)) &
+                           (forall MAXR:view,V:operation. (~le(r,MAXR) & commit_msg(n,I,MAXR,V)) -> le(MAXR,maxv(cr,I)))
+                          ));
+
+    view_change_msg(n,r,cr) := true;
+    view_change_proj(n,r) := true;
+    #local receive might be wrong
+    #l_view_change_msg(n,n,r,cr) := true;
+    #l_view_change_proj(n,n,r) := true;
+    cleft_view(n,R) := cleft_view(n,R) | ~le(r,R)
+}
+
+action rcv_view_change_msg(o:preplica, n:creplica, r:view, cr:creport) = {
+    assume r ~= none;
+    assume view_change_msg(n, r, cr);
+    assume view_change_proj(n, r);
+    assume forall I. commit_msg(n, I, maxv(cr,I), maxo(cr,I)) | maxv(cr,I) = none;
+    assume le(maxv(cr, I), r) & r ~= maxv(cr, I);
+    assume forall I. maxv(cr,I) = none | (exists Q:pbyzquorum. forall N1:preplica. pbyzmember(N1, Q) -> l_prepare_msg(n, N1, I, maxv(cr, I), maxo(cr, I)));
+    l_view_change_msg(o, n, r, cr) := true;
+    l_view_change_proj(o, n, r) := true;
+}
+
+relation reported_commit(N:creplica, I:slot, R:view, V:operation)
+
+action send_new_view_msg(n:preplica, r:view, q:cbyzquorum) = {
+    assume r ~= none;
+    assume n = primary(r);
+    assume ~pleft_view(n,r);
+    assume ~prepare_msg(n,I,r,V); #no sent preprepare 
+    assume forall N:creplica. cbyzmember(N, q) -> l_view_change_proj(n,N,r);
+    assume ~has_new_view(n,r);
+
+    reported_commit(N,I,R,V) := *;
+    assume forall N:creplica. cbyzmember(N, q) & l_view_change_msg(n,N,r,CR) -> reported_commit(N, I, maxv(CR,I), maxo(CR,I)); # view change commit is reported
+    assume forall N:creplica. cbyzmember(N, q) & l_view_change_msg(n,N,r,CR) & reported_commit(N, I, R1, V) -> le(R1, maxv(CR,I)); # view change commit is maximal reported commit (but not maximal commit if node is Byzantine)
+    assume cis_good(N) -> reported_commit(N,I,R,V);
+    local cr: creport {
+        # find max { r',v' | exists N. byzmember(N,q) & ~le(r,r') & commit_msg(N,r',v') & reported_commit(N,r',v') }
+        assume forall I.
+           (
+            (maxv(cr, I) = none & forall N:creplica,MAXR:view,V:operation. ~(cbyzmember(N, q) & ~le(r,MAXR) & good_commit_msg(N,I,MAXR,V) & reported_commit(N,I,MAXR,V))) |
+            (maxv(cr, I) ~= none &
+             (exists N:creplica. cbyzmember(N, q) & ~le(r,maxv(cr, I)) & good_commit_msg(N,I,maxv(cr, I), maxo(cr, I)) & reported_commit(N,I,maxv(cr,I),maxo(cr,I))) &
+             (forall N:creplica,MAXR:view,V:operation. (cbyzmember(N, q) & ~le(r,MAXR) & good_commit_msg(N,I,MAXR,V) & reported_commit(N,I,MAXR,V)) -> le(MAXR,maxv(cr,I)))
+        ));
+	new_view_msg(n,r,q) := true;
+	l_new_view_msg(n,n,r,q) := true;
+	has_new_view(n,r) := true;
+        
+	#send preprepare
+        prepare_msg(n, I, r, V) := prepare_msg(n, I, r, V) | (maxv(cr,I) ~= none & maxo(cr,I) = V);
+        l_preprepare_msg(n, n, I, r, V) := l_preprepare_msg(n, n, I, r, V) | (maxv(cr,I) ~= none & maxo(cr,I) = V);
+    }
+    # TODO: have preplica leave old views
+}
+
+action rcv_new_view_msg(n:preplica, r:view, q:cbyzquorum) = {
+    assume r ~= none;
+    assume n~= primary(r);
+    assume ~pleft_view(n,r);
+    assume ~prepare_msg(n,I,r,V); #no sent prepare 
+    assume forall N:creplica. cbyzmember(N, q) -> l_view_change_proj(n,N,r);
+    assume ~has_new_view(n,r);
+    assume new_view_msg(primary(r),r,q);
+
+    reported_commit(N,I,R,V) := *;
+    assume forall N:creplica. cbyzmember(N, q) & l_view_change_msg(n,N,r,CR) -> reported_commit(N, I, maxv(CR, I), maxo(CR, I));
+    assume forall N:creplica. cbyzmember(N, q) & l_view_change_msg(n,N,r,CR) & reported_commit(N,I,R1,V2) -> le(R1, maxv(CR,I)); 
+    assume cis_good(N) -> reported_commit(N,I,R,V);
+    local cr: creport {
+        # find max { r',v' | exists N. byzmember(N,q) & ~le(r,r') & commit_msg(N,r',v') & reported_commit(N,r',v') }
+        assume forall I.
+        (
+            (maxv(cr, I) = none & forall N:creplica,MAXR:view,V:operation. ~(cbyzmember(N, q) & ~le(r,MAXR) & good_commit_msg(N,I,MAXR,V) & reported_commit(N,I,MAXR,V))) |
+            (maxv(cr, I) ~= none &
+             (exists N:creplica. cbyzmember(N, q) & ~le(r,maxv(cr, I)) & good_commit_msg(N, I, maxv(cr, I), maxo(cr, I)) & reported_commit(N, I, maxv(cr, I), maxo(cr, I))) &
+             (forall N:creplica,MAXR:view,V:operation. (cbyzmember(N, q) & ~le(r,MAXR) & good_commit_msg(N,I,MAXR,V) & reported_commit(N,I,MAXR,V)) -> le(MAXR,maxv(cr, I)))
+        ));
+	
+        # if (forall I. maxv(cr, I) ~= none -> l_prepare_msg(n, primary(r), I, r, maxo(cr,I))) {
+	#     l_new_view_msg(n,primary(r),r,q) :=true;
+	#     prepare_msg(n, I, r, V) := prepare_msg(n, I, r, V) | (maxv(cr, I) ~= none & maxo(cr,I) = V); #send prepare
+	#     l_prepare_msg(n, n, I, r, V) := l_prepare_msg(n, n, I, r, V) | (maxv(cr, I) ~= none & maxo(cr,I) = V);
+	#     has_new_view(n,r) := true;
+	# }
+        assume (forall I. maxv(cr, I) ~= none -> prepare_msg(primary(r), I, r, maxo(cr,I)));
+	l_new_view_msg(n,primary(r),r,q) :=true;
+	prepare_msg(n, I, r, V) := prepare_msg(n, I, r, V) | (maxv(cr, I) ~= none & maxo(cr,I) = V); #send prepare
+	l_preprepare_msg(n, primary(r), I, r, V) := l_preprepare_msg(n, primary(r), I, r, V) | (maxv(cr, I) ~= none & maxo(cr,I) = V);
+	has_new_view(n,r) := true;
+    }
+}
+
+action send_preprepare_msg(n:preplica, i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    assume has_new_view(n,r);
+    assume primary(r) = n;
+    # assume ~pleft_view(n,r) & (forall R2. le(R2,r) & R2 ~= r -> left_view(n, R2));
+    assume ~prepare_msg(n,i,r,V);
+    prepare_msg(n, i, r, v) := true;
+    l_preprepare_msg(n, n, i, r, v) := true;
+}
+
+action rcv_preprepare_msg_c(o:creplica, n:preplica, i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    assume n = primary(r);
+    assume prepare_msg(n, i, r, v);
+    l_prepare_msg(o, n, i, r, v) := true;
+}
+
+action rcv_preprepare_msg_p(o:preplica, n:preplica, i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    assume n = primary(r);
+    assume prepare_msg(n, i, r, v);
+    l_preprepare_msg(o, n, i, r, v) := true;
+}
+
+action send_prepare_msg(n:preplica, i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    assume has_new_view(n,r);
+    assume n ~= primary(r);
+    assume ~prepare_msg(n,i,r,V);
+    assume l_preprepare_msg(n,primary(r),i,r,v);
+    prepare_msg(n, i, r, v) := true;
+    #l _prepare_msg(n, n, i, r, v) := true;
+}
+
+action rcv_prepare_msg(o:creplica, n:preplica, i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    assume n ~= primary(r);
+    assume prepare_msg(n, i, r, v);
+    l_prepare_msg(o, n, i, r, v) := true;
+}
+
+action send_commit_msg(n:creplica, i:slot, r:view, v:operation, q:pbyzquorum) = {
+    assume r ~= none;
+    assume ~cleft_view(n,r);
+    assume pbyzmember(N,q) -> l_prepare_msg(n, N, i, r, v);
+    commit_msg(n, i, r, v) := true;
+    # l_commit_msg(n, n, i, r, v) := true;
+}
+
+action rcv_commit_msg(o:ereplica, n:creplica ,i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    #assume byzmember(N,q) -> l_prepare_msg(o, N, i, r, v);
+    assume commit_msg(n, i, r, v);
+    l_commit_msg(o, n, i, r, v) := true;
+}
+
+action make_committed(i:slot, r:view, v:operation, q:cbyzquorum) = {
+    assume r ~= none;
+    assume cbyzmember(N, q) -> commit_msg(N, i, r, v);
+    committed(i, r, v) := true;
+}
+
+action observe_committed(n:ereplica, i:slot, v:operation) = {
+    assume exists R. committed(i, R, v);
+    l_committed(n, i, v) := true;
+}
+
+action send_checkpoint(n:ereplica, i:slot) = {
+    assume le_slot(I, i) -> exists V:operation. l_committed(n, I, V);
+    checkpoint_msg(n, i) := true;
+}
+
+# should add receive actions for preplica and creplica
+action rcv_checkpoint(o:ereplica, n:ereplica, i:slot) = {
+    assume checkpoint_msg(n, i); 
+    l_checkpoint_msg(o, n, i) := true;
+}
+
+action accept_checkpoint(n:ereplica, s:ereplica, i:slot, t:tquorum) = {
+    assume tmember(s, t);
+    assume tmember(N1, t) -> l_checkpoint_msg(n, N1, i);
+    assume le_slot(I, i) -> exists V. l_committed(s, I, V); 
+    #assume is_good(s);
+    assume tmember(N1, t) & tmember(N2, t) & le_slot(I, i) -> (l_committed(N1, I, V) <-> l_committed(N2, I, V));
+    l_committed(n, I, V) := l_committed(n, I, V) | (le_slot(I, i) & l_committed(s, I, V));
+}
+
+# allowing byz to send multiple prepare and preprepare
+action byz_send_preprepare_msg(n:preplica, i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    assume n = primary(r);
+    assume  ~pis_good(n);
+    prepare_msg(n, i, r, v) := true;
+}
+
+action byz_send_prepare_msg(n:preplica, i:slot, r:view, v:operation) = {
+    assume r ~= none;
+    assume n ~= primary(r);
+    assume  ~pis_good(n);
+    prepare_msg(n, i, r, v) := true;
+}
+
+# allow byz to send commits to rounds they left
+action byz_send_commit_msg(n:creplica, i:slot, r:view, v:operation, q:pbyzquorum) = {
+    assume r ~= none;
+    assume  ~cis_good(n);
+    commit_msg(n, i, r, v) := true;
+}
+
+# allow byz to send view_change, not reporting their true maximal commit, or sending after they left the round
+action byz_send_view_change_msg(n:creplica, r:view, cr:creport) = {
+    assume r ~= none;
+    assume ~cis_good(n);
+    view_change_msg(n,r,cr) := true;
+    view_change_proj(n,r) := true;
+    cleft_view(n,R) := cleft_view(n,R) | ~le(r,R)
+}
+
+action byz_send_new_view_msg(n:preplica, r:view, q:cbyzquorum) = {
+    assume r ~= none;
+    assume ~pis_good(n);
+    new_view_msg(n,r,q) := true;
+    has_new_view(n,r) := true;
+}
+
+action byz_send_checkpoint(n:ereplica, i:slot) = {
+    assume ~eis_good(n);
+    l_committed(n, I, V) := *;
+    checkpoint_msg(n, i) := true;
+}
+
+export send_view_change_msg
+export rcv_view_change_msg
+export send_new_view_msg
+export rcv_new_view_msg
+export send_preprepare_msg
+export rcv_preprepare_msg_c
+export rcv_preprepare_msg_p
+export send_prepare_msg
+export rcv_prepare_msg
+export send_commit_msg
+export rcv_commit_msg
+export make_committed
+export observe_committed
+export send_checkpoint
+export rcv_checkpoint
+export accept_checkpoint
+export byz_send_preprepare_msg
+export byz_send_prepare_msg
+export byz_send_commit_msg
+export byz_send_view_change_msg
+export byz_send_new_view_msg
+export byz_send_checkpoint
+
+# safety property:
+conjecture (
+    committed(I,R1,V1) &
+    committed(I,R2,V2)
+) -> V1 = V2
+
+conjecture pis_good(N) & prepare_msg(N, I, R, V1) & prepare_msg(N, I, R, V2) -> V1 = V2
+conjecture pis_good(N) & prepare_msg(N, I, R, V) -> l_preprepare_msg(N,primary(R), I, R, V)
+conjecture forall R,V. (exists N . commit_msg(N, I, R, V) & cis_good(N)) -> exists Q. forall N2. pbyzmember(N2,Q) -> prepare_msg(N2, I, R, V)
+
+conjecture forall R:view, V:operation. committed(I, R, V) -> exists Q. forall N:creplica. cbyzmember(N, Q) -> commit_msg(N, I, R, V)
+
+# properties of view_change_msg
+#conjecture view_change_msg(N,R2,none,V1) & ~le(R2,R1) -> ~commit_msg(N,R1,V2)
+#conjecture view_change_msg(N,R,RMAX,V) & RMAX ~= none -> ~le(R,RMAX) & commit_msg(N,RMAX,V)
+#conjecture view_change_msg(N,R,RMAX,V) & RMAX ~= none & ~le(R,ROTHER) & ~le(ROTHER,RMAX) -> ~commit_msg(N,ROTHER,VOTHER)
+
+# Properties of choosable and prepare_msg
+conjecture forall R1:view, R2:view, V1:operation, V2:operation, Q:cbyzquorum. pis_good(primary(R2)) & ~le(R2, R1) & prepare_msg(primary(R2), I, R2, V2) & V1 ~= V2 ->
+    exists N:creplica. cbyzmember(N, Q) & cis_good(N) & cleft_view(N, R1) & ~commit_msg(N, I, R1, V1)
+
+conjecture cis_good(N) & view_change_proj(N, R2) & ~le(R2, R1) -> cleft_view(N, R1)
+
+#conjecture forall R1:view, R2:view, V1:operation, Q:byzquorum. ~le(R2,R1) & available(R2) ->
+#    exists N:replica. byzmember(N,Q) & is_good(N) & left_view(N,R1) & ~commit_msg(N,R1,V1)
+
+#conjecture ~prepare_msg(N, R, V) & is_good(N) & has_new_view(N ,R) -> available(R)
+
+#conjecture forall R1:view, R2:view, V1:operation, Q:byzquorum. ~le(R2, R1) & (exists N2. ~prepare_msg(N2, I, R2, V1) & is_good(N2) & has_new_view(N2 ,R2)) ->
+#    exists N:replica. byzmember(N,Q) & is_good(N) & left_view(N,R1) & ~commit_msg(N, I, R1, V1)
+
+conjecture forall R1:view, R2:view, V1:operation, Q:cbyzquorum. ~le(R2, R1) & (exists N2:preplica. ~prepare_msg(N2, I, R2, V1) & pis_good(N2) & has_new_view(N2 ,R2)) ->
+    exists N:creplica. cbyzmember(N,Q) & cis_good(N) & cleft_view(N,R1) & ~commit_msg(N, I, R1, V1)
+
+
+conjecture pis_good(N) & prepare_msg(N, I, R, V) -> has_new_view(N, R)
+
+
+# aux invariant
+
+conjecture cis_good(N) & commit_msg(N, I, R, V1) & commit_msg(N, I, R, V2) -> V1 = V2
+
+conjecture cis_good(N) & commit_msg(N, I, R, V) -> good_commit_msg(N, I, R, V)
+
+conjecture cis_good(N) & view_change_msg(N, R2, CR) & ~le(R2, R1) & maxv(CR, I) = none -> ~commit_msg(N, I, R1,V2)
+
+conjecture cis_good(N) & view_change_msg(N, R, CR) & maxv(CR, I) ~= none -> ~le(R,maxv(CR, I)) 
+
+conjecture cis_good(N) & view_change_msg(N, R, CR) & maxv(CR, I) ~= none -> commit_msg(N, I, maxv(CR, I), maxo(CR, I))
+
+conjecture cis_good(N) & view_change_msg(N, R, CR) & maxv(CR, I) ~= none & ~le(R,ROTHER) & ~le(ROTHER, maxv(CR, I)) -> ~commit_msg(N, I, ROTHER, VOTHER)
+
+conjecture ~commit_msg(N, I, none, V)
+
+conjecture le(R1, R2) & cleft_view(N, R2) -> cleft_view(N, R1) 
+
+conjecture view_change_msg(N, R, CR) & ~le(R, R1) -> cleft_view(N, R1) 
+
+
+# local messages
+
+conjecture l_prepare_msg(O, N, I, R, V) -> prepare_msg(N, I, R, V)
+# conjecture prepare_msg(N, I, R, V) & pis_good(N) -> l_prepare_msg(N, N, I, R, V) #omitted, since enclave not sending to itselfs
+
+conjecture l_commit_msg(O, N, I, R, V) -> commit_msg(N, I, R, V)
+# conjecture commit_msg(N, I, R, V) & is_good(N) -> l_commit_msg(N, N, I, R, V) #omitted, since enclave not sending to itselfs
+
+conjecture l_view_change_msg(O, N, R, CR) -> view_change_msg(N, R, CR)
+conjecture l_view_change_msg(O, N, R, CR) & maxv(CR, I) ~= none & pis_good(O) -> commit_msg(N, I, maxv(CR, I), maxo(CR, I)) & good_commit_msg(N, I, maxv(CR, I), maxo(CR, I))
+conjecture l_view_change_msg(O, N, R, CR) & pis_good(O) -> le(maxv(CR, I), R) & R ~= maxv(CR, I)
+# conjecture view_change_msg(N, R1, CR) & cis_good(N) -> l_view_change_msg(N, N, R1, CR) #omitted, since enclave not sending to itselfs
+
+conjecture l_view_change_proj(O, N, V) -> view_change_proj(N, V)
+# conjecture view_change_proj(N, V) & cis_good(N) -> l_view_change_proj(N, N, V)
+
+# for checkpoints
+
+conjecture (exists N. l_committed(N, I, V) & eis_good(N)) -> (exists R. committed(I, R, V))
+
+conjecture l_checkpoint_msg(O, N, I) -> checkpoint_msg(N, I)
+
+conjecture (exists N. checkpoint_msg(N, I) & eis_good(N) & le_slot(I2, I)) -> (exists R:view, V:operation. committed(I2, R, V))
+
+conjecture l_committed(N, I, V1) & l_committed(N, I, V2) & eis_good(N) -> V1 = V2
